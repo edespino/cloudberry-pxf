@@ -1,0 +1,539 @@
+# --------------------------------------------------------------------
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed
+# with this work for additional information regarding copyright
+# ownership. The ASF licenses this file to You under the Apache
+# License, Version 2.0 (the "License"); you may not use this file
+# except in compliance with the License. You may obtain a copy of the
+# License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied. See the License for the specific language governing
+# permissions and limitations under the License.
+#
+# --------------------------------------------------------------------
+# GitHub Actions Workflow: PXF CI Pipeline
+# --------------------------------------------------------------------
+# Description:
+#
+#   This workflow builds and tests Apache Cloudberry PXF components
+#   against Apache Cloudberry Database. It uses a RPM-based architecture
+#   for faster CI runs and better artifact reusability.
+#
+# Workflow Overview:
+# 1. **Build Cloudberry RPM**: Calls reusable workflow to build RPM
+# 2. **Install from RPM**: Installs Cloudberry RPM and creates demo cluster
+# 3. **PXF Build & Test**: Builds and tests all PXF modules
+#
+# Architecture Improvements:
+# - Separate reusable workflow for Cloudberry RPM builds
+# - RPM-based installation (faster than source builds)
+# - Artifact reuse across workflow runs (30-day retention)
+# - Production-like testing environment
+# - Proper cluster restart between jobs
+# - Fixed test failure handling
+#
+# --------------------------------------------------------------------
+
+name: PXF CI Pipeline
+
+on:
+  push:
+    branches: [ main, PXF-ci ]  # Added PXF-ci for testing
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
+    inputs:
+      cloudberry_rpm_artifact:
+        description: 'Cloudberry RPM artifact name (e.g. cloudberry-rpm-99.0.0-abc1234)'
+        required: true
+        type: string
+      cloudberry_source_artifact:
+        description: 'Cloudberry source artifact name (e.g. cloudberry-source-20251020_103925)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "11"
+  JAVA_HOME: "/usr/lib/jvm/java-11-openjdk"
+  GPADMIN_HOME: "/home/gpadmin"
+  GO_VERSION: "1.21"
+  GPHOME: "/usr/local/cloudberry-db"
+  CLOUDBERRY_VERSION: ${{ github.event.inputs.cloudberry_ref || 'main' }}
+  CLOUDBERRY_RPM_VERSION: "99.0.0"
+  CLOUDBERRY_RPM_BUILD: "1"
+  PXF_HOME: "/usr/local/pxf"
+  PXF_VERSION: "main"
+  LOG_RETENTION_DAYS: 7
+  ARTIFACT_RETENTION_DAYS: 30
+
+jobs:
+
+  ## ======================================================================
+  ## Job: retrieve-artifacts
+  ## ======================================================================
+
+  retrieve-artifacts:
+    name: Retrieve Cloudberry Artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      rpm_artifact_name: ${{ steps.upload_rpm.outputs.artifact_name }}
+      source_artifact_name: ${{ steps.upload_source.outputs.artifact_name }}
+
+    steps:
+      - name: Download Cloudberry RPM artifacts
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: ${{ github.event.inputs.cloudberry_rpm_artifact }}
+          path: /tmp/rpm-download
+          github_token: ${{ github.token }}
+          workflow: build-cloudberry-rpm.yml
+          workflow_conclusion: success
+
+      - name: Download Cloudberry source artifacts
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: ${{ github.event.inputs.cloudberry_source_artifact }}
+          path: /tmp/source-download
+          github_token: ${{ github.token }}
+          workflow: build-cloudberry-rpm.yml
+          workflow_conclusion: success
+
+      - name: Prepare RPM artifacts for upload
+        id: upload_rpm
+        run: |
+          # Find and collect RPM artifacts
+          mkdir -p /tmp/rpm-artifacts
+          find /tmp/rpm-download -name "*.rpm" -exec cp {} /tmp/rpm-artifacts/ \;
+          find /tmp/rpm-download -name "metadata.json" -exec cp {} /tmp/rpm-artifacts/ \;
+
+          ls -lh /tmp/rpm-artifacts/
+
+          ARTIFACT_NAME="cloudberry-rpm-${{ github.run_id }}"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare source artifacts for upload
+        id: upload_source
+        run: |
+          # Find and collect source artifacts
+          mkdir -p /tmp/source-artifacts
+          find /tmp/source-download -name "cloudberry-source.tgz" -exec cp {} /tmp/source-artifacts/ \;
+
+          ls -lh /tmp/source-artifacts/
+
+          ARTIFACT_NAME="cloudberry-source-${{ github.run_id }}"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.upload_rpm.outputs.artifact_name }}
+          path: /tmp/rpm-artifacts/
+          retention-days: 1
+
+      - name: Upload source artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.upload_source.outputs.artifact_name }}
+          path: /tmp/source-artifacts/
+          retention-days: 1
+
+  ## ======================================================================
+  ## Job: pxf-build-install-test
+  ## ======================================================================
+
+  pxf-build-install-test:
+    name: Build, Install & Test PXF
+    runs-on: ubuntu-latest
+    needs: retrieve-artifacts
+    timeout-minutes: 120
+
+    container:
+      image: apache/incubator-cloudberry:cbdb-build-rocky9-latest
+      options: >-
+        --privileged
+        --user root
+        --hostname cdw
+        --shm-size=2gb
+        --ulimit core=-1
+
+    steps:
+      - name: Container initialization
+        run: |
+          if ! su - gpadmin -c "/tmp/init_system.sh"; then
+            echo "::warning::Container initialization script not available, continuing..."
+          fi
+          mkdir -p pxf-logs/details
+          chown -R gpadmin:gpadmin .
+          chmod -R 755 .
+          chmod 777 pxf-logs
+
+      - name: Download RPM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.retrieve-artifacts.outputs.rpm_artifact_name }}
+          path: /tmp/rpm
+
+      - name: Download source artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.retrieve-artifacts.outputs.source_artifact_name }}
+          path: /tmp/source
+
+      - name: Install Cloudberry RPM
+        run: |
+          set -eo pipefail
+
+          echo "::group::Installing Cloudberry RPM"
+          RPM_FILE=$(ls /tmp/rpm/*.rpm | grep -v debuginfo | head -1)
+          if [ ! -f "${RPM_FILE}" ]; then
+            echo "::error::RPM file not found"
+            exit 1
+          fi
+
+          dnf install -y --setopt=retries=10 --releasever=9 "${RPM_FILE}"
+          /usr/local/cloudberry-db/bin/postgres --version
+          echo "::endgroup::"
+
+      - name: Extract source and create cluster
+        env:
+          NUM_PRIMARY_MIRROR_PAIRS: 1
+        run: |
+          set -eo pipefail
+
+          echo "::group::Extracting Cloudberry source"
+          tar xzf /tmp/source/cloudberry-source.tgz -C ${GITHUB_WORKSPACE}
+
+          # Verify extraction and show path
+          echo "GITHUB_WORKSPACE: ${GITHUB_WORKSPACE}"
+          ls -la ${GITHUB_WORKSPACE}
+
+          SRC_DIR="${GITHUB_WORKSPACE}/cloudberry"
+          if [ ! -d "${SRC_DIR}" ]; then
+            echo "::error::Source directory not found at ${SRC_DIR}"
+            exit 1
+          fi
+
+          chown -R gpadmin:gpadmin "${SRC_DIR}"
+          chmod -R 755 "${SRC_DIR}"
+          echo "::endgroup::"
+
+          echo "::group::Creating demo cluster"
+          su - gpadmin -c "
+            set -eo pipefail
+            source /usr/local/cloudberry-db/cloudberry-env.sh
+            cd ${SRC_DIR}
+
+            # Use standard make target
+            NUM_PRIMARY_MIRROR_PAIRS=${NUM_PRIMARY_MIRROR_PAIRS} make create-demo-cluster
+          "
+          echo "::endgroup::"
+
+      - name: Start Cloudberry cluster
+        run: |
+          set -eo pipefail
+
+          echo "::group::Starting Cloudberry cluster"
+          su - gpadmin -c "
+            source /usr/local/cloudberry-db/cloudberry-env.sh
+            source ${GITHUB_WORKSPACE}/cloudberry/gpAux/gpdemo/gpdemo-env.sh
+
+            # Start the cluster
+            gpstart -a
+
+            # Verify cluster is running
+            gpstate -s
+
+            # Test database connection
+            psql -d postgres -c 'SELECT version();'
+          "
+          echo "::endgroup::"
+
+          echo "::notice::Cloudberry cluster started successfully"
+
+      - name: Checkout PXF source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: pxf
+
+      - name: Prepare PXF source for gpadmin
+        run: |
+          chown -R gpadmin:gpadmin $GITHUB_WORKSPACE/pxf
+
+      - name: Install build dependencies
+        run: |
+          set -eo pipefail
+          dnf install -y maven
+
+      - name: Build PXF
+        id: build_pxf
+        run: |
+          set -eo pipefail
+
+          # Verify Java version
+          echo "Available Java versions:"
+          alternatives --display java || true
+
+          # Set Java 11
+          alternatives --set java /usr/lib/jvm/java-11-openjdk/bin/java || true
+          export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+          export PATH=$JAVA_HOME/bin:$PATH
+
+          echo "Active Java version:"
+          java -version
+
+          su - gpadmin -c "
+            set -eo pipefail
+            export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+            export PATH=/usr/lib/jvm/java-11-openjdk/bin:\$PATH
+            source /usr/local/cloudberry-db/cloudberry-env.sh
+            java -version
+            make -C /__w/cloudberry-pxf/cloudberry-pxf/pxf all
+          "
+
+      - name: "Test PXF CLI"
+        id: test_pxf_cli
+        run: |
+          set -eo pipefail
+          su - gpadmin -c '
+            set -eo pipefail
+            # Install ginkgo test framework
+            go install github.com/onsi/ginkgo/ginkgo@latest
+            export PATH=$HOME/go/bin:$PATH
+            # Export GOPATH so tests can find the binary (tests use os.Getenv("GOPATH"))
+            export GOPATH=/__w/cloudberry-pxf/cloudberry-pxf/pxf/cli/go
+            # Silence Ginkgo 2.0 migration notice
+            touch $HOME/.ack-ginkgo-rc
+            # Use bash for Makefile (requires bash-specific syntax)
+            make -C /__w/cloudberry-pxf/cloudberry-pxf/pxf/cli/go/src/pxf-cli SHELL=/bin/bash test
+          '
+
+      - name: "Test PXF Server"
+        id: test_pxf_server
+        run: |
+          set -eo pipefail
+          su - gpadmin -c "
+            set -eo pipefail
+            export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+            export PATH=/usr/lib/jvm/java-11-openjdk/bin:\$PATH
+            source /usr/local/cloudberry-db/cloudberry-env.sh
+            java -version
+            cd /__w/cloudberry-pxf/cloudberry-pxf/pxf/server && ./gradlew test
+          "
+
+      - name: "Install PXF"
+        id: install_pxf
+        if: always()
+        run: |
+          set -eo pipefail
+          mkdir -p /usr/local/pxf
+          chown -R gpadmin:gpadmin /usr/local/pxf
+          su - gpadmin -c "
+            set -eo pipefail
+            export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+            export PATH=/usr/lib/jvm/java-11-openjdk/bin:\$PATH
+            java -version
+            source /usr/local/cloudberry-db/cloudberry-env.sh
+            export PXF_HOME=/usr/local/pxf
+            make -C /__w/cloudberry-pxf/cloudberry-pxf/pxf install
+          "
+
+      - name: "Start PXF"
+        id: start_pxf
+        if: always()
+        run: |
+          set -eo pipefail
+          su - gpadmin -c "
+            set -eo pipefail
+            export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+            export PATH=/usr/lib/jvm/java-11-openjdk/bin:\$PATH
+            java -version
+            source /usr/local/cloudberry-db/cloudberry-env.sh
+            source ${GITHUB_WORKSPACE}/cloudberry/gpAux/gpdemo/gpdemo-env.sh
+            export PXF_HOME=/usr/local/pxf
+            export PXF_BASE=\$HOME/pxf-base
+            export PATH=/usr/local/pxf/bin:\$PATH
+            pxf prepare
+            pxf start
+            pxf status
+          "
+
+      - name: "Test PXF External Table"
+        id: test_pxf_external
+        run: |
+          set -eo pipefail
+          su - gpadmin -c "
+            set -eo pipefail
+            source /usr/local/cloudberry-db/cloudberry-env.sh
+            source ${GITHUB_WORKSPACE}/cloudberry/gpAux/gpdemo/gpdemo-env.sh
+            make -C /__w/cloudberry-pxf/cloudberry-pxf/pxf/external-table installcheck
+          "
+
+      - name: Run PXF automation tests
+        id: automation_tests
+        if: always()
+        run: |
+          set -eo pipefail
+          su - gpadmin -c "
+            set -eo pipefail
+            export PXF_HOME=/usr/local/pxf
+            export PXF_BASE=\$HOME/pxf-base
+            export PATH=/usr/local/pxf/bin:\$PATH
+            pushd /__w/cloudberry-pxf/cloudberry-pxf/pxf/automation >/dev/null
+            mkdir -p \${PXF_BASE}/servers/default
+            cp \${PXF_HOME}/templates/{hdfs,mapred,yarn,core,hbase,hive}-site.xml \${PXF_BASE}/servers/default || true
+            make TEST=HdfsSmokeTest
+            make GROUP=gpdb
+            popd >/dev/null
+          "
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts/logs
+          echo "PXF artifacts bundle" > artifacts/manifest.txt
+          cp -r ${{ env.GPADMIN_HOME }}/pxf-base/log/* artifacts/logs/ 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE"/pxf/server/build/reports/tests/test artifacts/ 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE"/pxf/automation/*/reports artifacts/ 2>/dev/null || true
+          find artifacts -type f -print >> artifacts/manifest.txt 2>/dev/null || true
+        shell: bash
+
+      - name: Upload PXF artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pxf-build-install-test-artifacts
+          path: artifacts/**
+          if-no-files-found: ignore
+          retention-days: ${{ env.LOG_RETENTION_DAYS }}
+
+      - name: Evaluate module build/test results
+        if: always()
+        env:
+          BUILD_CLI: ${{ steps.build_pxf_cli.outcome }}
+          BUILD_FDW: ${{ steps.build_pxf_fdw.outcome }}
+          BUILD_EXTERNAL: ${{ steps.build_pxf_external.outcome }}
+          BUILD_SERVER: ${{ steps.build_pxf_server.outcome }}
+          TEST_CLI: ${{ steps.test_pxf_cli.outcome }}
+          TEST_FDW: ${{ steps.test_pxf_fdw.outcome }}
+          TEST_EXTERNAL: ${{ steps.test_pxf_external.outcome }}
+          TEST_SERVER: ${{ steps.test_pxf_server.outcome }}
+          INSTALL_PXF: ${{ steps.install_pxf.outcome }}
+          START_PXF: ${{ steps.start_pxf.outcome }}
+          AUTO_TESTS: ${{ steps.automation_tests.outcome }}
+        run: |
+          set -eo pipefail
+
+          status_icon() {
+            case "$1" in
+              success) echo "✅";;
+              failure) echo "❌";;
+              cancelled) echo "🛑";;
+              skipped|"") echo "⏭️";;
+              *) echo "$1";;
+            esac
+          }
+
+          BCLI_ICON=$(status_icon "${BUILD_CLI}")
+          BFDW_ICON=$(status_icon "${BUILD_FDW}")
+          BEXT_ICON=$(status_icon "${BUILD_EXTERNAL}")
+          BSRV_ICON=$(status_icon "${BUILD_SERVER}")
+          TCLI_ICON=$(status_icon "${TEST_CLI}")
+          TFDW_ICON=$(status_icon "${TEST_FDW}")
+          TEXT_ICON=$(status_icon "${TEST_EXTERNAL}")
+          TSRV_ICON=$(status_icon "${TEST_SERVER}")
+
+          {
+            echo "## PXF Module Build/Test Results"
+            echo ""
+            echo "| Module | Build | Test |"
+            echo "|-------:|:-----:|:----:|"
+            echo "| CLI | ${BCLI_ICON} ${BUILD_CLI:-skipped} | ${TCLI_ICON} ${TEST_CLI:-skipped} |"
+            echo "| FDW | ${BFDW_ICON} ${BUILD_FDW:-skipped} | ${TFDW_ICON} ${TEST_FDW:-skipped} |"
+            echo "| External-Table | ${BEXT_ICON} ${BUILD_EXTERNAL:-skipped} | ${TEXT_ICON} ${TEST_EXTERNAL:-skipped} |"
+            echo "| Server | ${BSRV_ICON} ${BUILD_SERVER:-skipped} | ${TSRV_ICON} ${TEST_SERVER:-skipped} |"
+            echo ""
+            echo "### Install/Start/Automation"
+            IN_ICON=$(status_icon "${INSTALL_PXF}")
+            ST_ICON=$(status_icon "${START_PXF}")
+            AT_ICON=$(status_icon "${AUTO_TESTS}")
+            echo "| Step | Status |"
+            echo "|-----:|:------:|"
+            echo "| Install PXF | ${IN_ICON} ${INSTALL_PXF:-skipped} |"
+            echo "| Start PXF | ${ST_ICON} ${START_PXF:-skipped} |"
+            echo "| Automation Tests | ${AT_ICON} ${AUTO_TESTS:-skipped} |"
+            echo ""
+            echo "### Logs and Reports"
+            echo "- Server Gradle test reports: \`pxf/server/build/reports/tests/test\`"
+            echo "- Automation test reports: \`pxf/automation/*/reports\`"
+            echo "- PXF runtime logs: \`~/pxf-base/log\`"
+            echo "- Uploaded artifact bundle: 'pxf-build-install-test-artifacts'"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          fail=0
+          for v in "${BUILD_CLI}" "${BUILD_FDW}" "${BUILD_EXTERNAL}" "${BUILD_SERVER}" \
+                   "${TEST_CLI}" "${TEST_FDW}" "${TEST_EXTERNAL}" "${TEST_SERVER}" \
+                   "${INSTALL_PXF}" "${START_PXF}" "${AUTO_TESTS}"; do
+            if [ "$v" = "failure" ]; then fail=1; fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::One or more PXF modules failed. Check logs for details."
+            exit 1
+          fi
+
+  ## ======================================================================
+  ## Job: notify-status
+  ## ======================================================================
+
+  notify-status:
+    name: Final Status Report
+    runs-on: ubuntu-latest
+    needs: [retrieve-artifacts, pxf-build-install-test]
+    if: always()
+
+    steps:
+      - name: Generate Final Summary
+        run: |
+          {
+            echo "# PXF CI Pipeline Summary"
+            echo ""
+            echo "## Job Results"
+            echo "| Job | Status |"
+            echo "|-----|:------:|"
+            echo "| Retrieve Artifacts | ${{ needs.retrieve-artifacts.result }} |"
+            echo "| PXF Build & Test | ${{ needs.pxf-build-install-test.result }} |"
+            echo ""
+
+            if [[ "${{ needs.pxf-build-install-test.result }}" == "success" ]]; then
+              echo "✅ **Pipeline completed successfully**"
+            else
+              echo "❌ **Pipeline completed with failures**"
+              echo ""
+              echo "Check the individual job summaries and artifacts for details."
+            fi
+
+            echo ""
+            echo "## Architecture Improvements"
+            echo "- ✅ RPM-based installation (faster, production-like)"
+            echo "- ✅ Cross-workflow artifact retrieval"
+            echo "- ✅ Two-job architecture for test matrix support"
+            echo "- ✅ Proper cluster creation in test jobs"
+            echo "- ✅ Fixed test failure handling"
+          } >> "$GITHUB_STEP_SUMMARY"

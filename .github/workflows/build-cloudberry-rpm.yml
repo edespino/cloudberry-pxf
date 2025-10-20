@@ -1,0 +1,407 @@
+# --------------------------------------------------------------------
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed
+# with this work for additional information regarding copyright
+# ownership. The ASF licenses this file to You under the Apache
+# License, Version 2.0 (the "License"); you may not use this file
+# except in compliance with the License. You may obtain a copy of the
+# License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied. See the License for the specific language governing
+# permissions and limitations under the License.
+#
+# --------------------------------------------------------------------
+# GitHub Actions Workflow: Build Cloudberry RPM
+# --------------------------------------------------------------------
+# Description:
+#
+#   Reusable workflow for building Apache Cloudberry Database RPM packages.
+#   Can be called by other workflows or triggered independently.
+#
+# Usage:
+#
+#   As a called workflow:
+#   ```yaml
+#   jobs:
+#     build-rpm:
+#       uses: apache/cloudberry-pxf/.github/workflows/build-cloudberry-rpm.yml@main
+#       with:
+#         cloudberry_ref: main
+#   ```
+#
+#   Manual trigger via UI or CLI:
+#   ```bash
+#   gh workflow run build-cloudberry-rpm.yml -f cloudberry_ref=main
+#   ```
+#
+#   Scheduled (weekly builds to keep fresh RPMs available)
+#
+# --------------------------------------------------------------------
+
+name: Build Cloudberry RPM
+
+on:
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      cloudberry_ref:
+        description: 'Cloudberry branch/tag/commit to build'
+        required: false
+        default: 'main'
+        type: string
+
+  # Enable for testing on PXF-ci branch
+  push:
+    branches: [ PXF-ci ]
+    paths:
+      - '.github/workflows/build-cloudberry-rpm.yml'
+
+  # Allow other workflows to call this
+  workflow_call:
+    inputs:
+      cloudberry_ref:
+        description: 'Cloudberry branch/tag/commit to build'
+        type: string
+        required: false
+        default: 'main'
+    outputs:
+      rpm_artifact_name:
+        description: "Name of the artifact containing Cloudberry RPM"
+        value: ${{ jobs.build-cloudberry-rpm.outputs.rpm_artifact_name }}
+      rpm_filename:
+        description: "Filename of the RPM package"
+        value: ${{ jobs.build-cloudberry-rpm.outputs.rpm_filename }}
+      rpm_version:
+        description: "Version of the RPM package"
+        value: ${{ jobs.build-cloudberry-rpm.outputs.rpm_version }}
+      build_timestamp:
+        description: "Build timestamp"
+        value: ${{ jobs.build-cloudberry-rpm.outputs.build_timestamp }}
+      commit_sha:
+        description: "Cloudberry commit SHA"
+        value: ${{ jobs.build-cloudberry-rpm.outputs.commit_sha }}
+
+  # Weekly builds to keep fresh RPMs available (optional, can uncomment)
+  # schedule:
+  #   - cron: '0 0 * * 0'  # Every Sunday at midnight UTC
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  CLOUDBERRY_VERSION: ${{ inputs.cloudberry_ref || github.event.inputs.cloudberry_ref || 'main' }}
+  CLOUDBERRY_RPM_VERSION: "99.0.0"
+  CLOUDBERRY_RPM_BUILD: "1"
+  ARTIFACT_RETENTION_DAYS: 30
+
+jobs:
+  build-cloudberry-rpm:
+    name: Build Cloudberry RPM Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      rpm_artifact_name: ${{ steps.set_outputs.outputs.artifact_name }}
+      rpm_filename: ${{ steps.create_rpm.outputs.rpm_filename }}
+      rpm_version: ${{ steps.version_info.outputs.version }}
+      build_timestamp: ${{ steps.set_timestamp.outputs.timestamp }}
+      commit_sha: ${{ steps.version_info.outputs.commit }}
+
+    container:
+      image: apache/incubator-cloudberry:cbdb-build-rocky9-latest
+      options: >-
+        --user root
+        -h cdw
+        --shm-size=2gb
+
+    steps:
+      - name: Set build timestamp
+        id: set_timestamp
+        run: |
+          timestamp=$(date +'%Y%m%d_%H%M%S')
+          echo "timestamp=$timestamp" | tee -a "$GITHUB_OUTPUT"
+          echo "BUILD_TIMESTAMP=$timestamp" | tee -a "$GITHUB_ENV"
+
+      - name: Container initialization
+        run: |
+          if ! su - gpadmin -c "/tmp/init_system.sh"; then
+            echo "::warning::Container initialization script not available, continuing..."
+          fi
+
+          # Install RPM build tools and jq for JSON generation
+          dnf install -y rpm-build rpmdevtools jq
+
+          # Setup directory structure
+          rpmdev-setuptree
+          mkdir -p build-logs/details
+          chown -R gpadmin:gpadmin .
+          chmod -R 755 .
+          chmod 777 build-logs
+
+          # Cleanup disk space
+          echo "::group::Disk Space"
+          df -kh /
+          rm -rf /__t/* || true
+          df -kh /
+          echo "::endgroup::"
+
+      - name: Checkout Apache Cloudberry source
+        uses: actions/checkout@v4
+        with:
+          repository: apache/cloudberry
+          ref: ${{ env.CLOUDBERRY_VERSION }}
+          path: cloudberry
+          fetch-depth: 1
+          submodules: true
+
+      - name: Get Cloudberry version info
+        id: version_info
+        run: |
+          cd cloudberry
+          VERSION="${CLOUDBERRY_RPM_VERSION}"
+          COMMIT_SHA=$(git rev-parse HEAD)
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date +%Y%m%d)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Building Cloudberry ${VERSION} from commit ${COMMIT_SHORT} (${COMMIT_SHA})"
+
+      - name: Configure Apache Cloudberry
+        env:
+          SRC_DIR: ${{ github.workspace }}/cloudberry
+          LOGS_DIR: build-logs
+        run: |
+          set -eo pipefail
+
+          # Create log directories that configure script expects
+          mkdir -p "${SRC_DIR}/${LOGS_DIR}" "${SRC_DIR}/${LOGS_DIR}/details"
+
+          chown -R gpadmin:gpadmin "${SRC_DIR}"
+          chmod -R 755 "${SRC_DIR}"
+          chmod 777 "${SRC_DIR}/${LOGS_DIR}"
+          chmod +x "${SRC_DIR}"/devops/build/automation/cloudberry/scripts/configure-cloudberry.sh
+
+          echo "::group::Configure Cloudberry"
+          if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ENABLE_DEBUG=false ${SRC_DIR}/devops/build/automation/cloudberry/scripts/configure-cloudberry.sh"; then
+            echo "::error::Configure script failed"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Build Apache Cloudberry
+        env:
+          SRC_DIR: ${{ github.workspace }}/cloudberry
+        run: |
+          set -eo pipefail
+          chmod +x "${SRC_DIR}"/devops/build/automation/cloudberry/scripts/build-cloudberry.sh
+
+          echo "::group::Build Cloudberry"
+          if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ${SRC_DIR}/devops/build/automation/cloudberry/scripts/build-cloudberry.sh"; then
+            echo "::error::Build script failed"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          # Verify critical binaries
+          if [ ! -x "/usr/local/cloudberry-db/bin/postgres" ]; then
+            echo "::error::postgres binary not found or not executable"
+            exit 1
+          fi
+
+          echo "::group::Binary Verification"
+          /usr/local/cloudberry-db/bin/postgres --version | tee -a build-logs/details/postgres-version.log
+          /usr/local/cloudberry-db/bin/psql --version | tee -a build-logs/details/postgres-version.log
+          echo "::endgroup::"
+
+      - name: Create RPM package
+        id: create_rpm
+        env:
+          SRC_DIR: ${{ github.workspace }}/cloudberry
+          VERSION: ${{ steps.version_info.outputs.version }}
+          BUILD_NUMBER: ${{ env.CLOUDBERRY_RPM_BUILD }}
+          COMMIT_SHORT: ${{ steps.version_info.outputs.commit }}
+          COMMIT_SHA: ${{ steps.version_info.outputs.commit_sha }}
+          BUILD_DATE: ${{ steps.version_info.outputs.build_date }}
+          BUILD_TIMESTAMP: ${{ steps.set_timestamp.outputs.timestamp }}
+          CLOUDBERRY_REF: ${{ env.CLOUDBERRY_VERSION }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_NUMBER: ${{ github.run_number }}
+          TRIGGERED_BY: ${{ github.event_name }}
+        run: |
+          set -eo pipefail
+
+          # Link RPM spec file
+          ln -sf "${SRC_DIR}"/devops/build/packaging/rpm/apache-cloudberry-db-incubating.spec \
+                 "${HOME}"/rpmbuild/SPECS/apache-cloudberry-db-incubating.spec
+
+          # Copy LICENSE
+          cp "${SRC_DIR}"/LICENSE /usr/local/cloudberry-db/
+
+          # Build RPM using Cloudberry's build script
+          echo "::group::Build RPM"
+          chmod +x "${SRC_DIR}"/devops/build/packaging/rpm/build-rpm.sh
+          "${SRC_DIR}"/devops/build/packaging/rpm/build-rpm.sh \
+            --version "${VERSION}" \
+            --release "${BUILD_NUMBER}"
+          echo "::endgroup::"
+
+          # Get OS version and locate RPM
+          os_version=$(grep -oP '(?<=^VERSION_ID=")[0-9]' /etc/os-release)
+          RPM_FILE="${HOME}"/rpmbuild/RPMS/x86_64/apache-cloudberry-db-incubating-"${VERSION}"-"${BUILD_NUMBER}".el"${os_version}".x86_64.rpm
+          RPM_DEBUG="${HOME}"/rpmbuild/RPMS/x86_64/apache-cloudberry-db-incubating-debuginfo-"${VERSION}"-"${BUILD_NUMBER}".el"${os_version}".x86_64.rpm
+
+          if [ ! -f "${RPM_FILE}" ]; then
+            echo "::error::RPM file not found: ${RPM_FILE}"
+            exit 1
+          fi
+
+          # Copy RPMs to workspace
+          mkdir -p "${GITHUB_WORKSPACE}"/rpms
+          cp "${RPM_FILE}" "${GITHUB_WORKSPACE}"/rpms/
+          cp "${RPM_DEBUG}" "${GITHUB_WORKSPACE}"/rpms/ || true
+
+          RPM_BASENAME=$(basename "$RPM_FILE")
+          echo "rpm_filename=${RPM_BASENAME}" >> "$GITHUB_OUTPUT"
+
+          # Verify RPM contents
+          echo "::group::RPM Package Information"
+          rpm -qip "${RPM_FILE}"
+          echo "::endgroup::"
+
+          # Calculate checksum
+          echo "::group::RPM Checksums"
+          sha256sum "${RPM_FILE}" | tee build-logs/details/rpm-checksum.log
+          echo "::endgroup::"
+
+          # Create metadata file using jq
+          jq -n \
+            --arg version "${VERSION}" \
+            --arg build_number "${BUILD_NUMBER}" \
+            --arg commit "$COMMIT_SHORT" \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg build_date "$BUILD_DATE" \
+            --arg build_timestamp "$BUILD_TIMESTAMP" \
+            --arg rpm_filename "${RPM_BASENAME}" \
+            --arg cloudberry_ref "${CLOUDBERRY_REF}" \
+            --arg workflow_name "$WORKFLOW_NAME" \
+            --arg workflow_run_id "$WORKFLOW_RUN_ID" \
+            --arg workflow_run_number "$WORKFLOW_RUN_NUMBER" \
+            --arg triggered_by "$TRIGGERED_BY" \
+            '{
+              version: $version,
+              build_number: $build_number,
+              commit: $commit,
+              commit_sha: $commit_sha,
+              build_date: $build_date,
+              build_timestamp: $build_timestamp,
+              rpm_filename: $rpm_filename,
+              cloudberry_ref: $cloudberry_ref,
+              workflow_name: $workflow_name,
+              workflow_run_id: $workflow_run_id,
+              workflow_run_number: $workflow_run_number,
+              triggered_by: $triggered_by
+            }' > "${GITHUB_WORKSPACE}"/rpms/metadata.json
+
+          echo "::notice::Created RPM: ${RPM_BASENAME}"
+
+      - name: Set workflow outputs
+        id: set_outputs
+        run: |
+          ARTIFACT_NAME="cloudberry-rpm-${{ steps.version_info.outputs.version }}-${{ steps.version_info.outputs.commit }}"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Artifact name: ${ARTIFACT_NAME}"
+
+      - name: Upload Cloudberry RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set_outputs.outputs.artifact_name }}
+          path: |
+            rpms/*.rpm
+            rpms/metadata.json
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          compression-level: 0
+
+      - name: Create source tarball for artifact
+        env:
+          SRC_DIR: ${{ github.workspace }}/cloudberry
+        run: |
+          echo "Creating source tarball..."
+          # Create tarball from cloudberry directory
+          tar czf cloudberry-source.tgz -C "${SRC_DIR}"/.. cloudberry
+
+          # Verify tarball
+          echo "Verifying source tarball..."
+          if ! tar tzf cloudberry-source.tgz > /dev/null; then
+            echo "::error::Source tarball verification failed"
+            exit 1
+          fi
+
+          # Show tarball info
+          ls -lh cloudberry-source.tgz
+          echo "Tarball created successfully"
+
+      - name: Upload Cloudberry source tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudberry-source-${{ steps.set_timestamp.outputs.timestamp }}
+          path: cloudberry-source.tgz
+          retention-days: 7
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudberry-build-logs-${{ steps.set_timestamp.outputs.timestamp }}
+          path: build-logs/
+          retention-days: 7
+
+      - name: Build Summary
+        run: |
+          {
+            echo "# Cloudberry RPM Build Complete ✅"
+            echo ""
+            echo "## Build Details"
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Version | ${{ steps.version_info.outputs.version }} |"
+            echo "| Commit (Short) | ${{ steps.version_info.outputs.commit }} |"
+            echo "| Commit (Full) | ${{ steps.version_info.outputs.commit_sha }} |"
+            echo "| Build Date | ${{ steps.version_info.outputs.build_date }} |"
+            echo "| Build Timestamp | ${{ steps.set_timestamp.outputs.timestamp }} |"
+            echo "| RPM Filename | ${{ steps.create_rpm.outputs.rpm_filename }} |"
+            echo "| Artifact Name | ${{ steps.set_outputs.outputs.artifact_name }} |"
+            echo "| Cloudberry Ref | ${{ env.CLOUDBERRY_VERSION }} |"
+            echo ""
+            echo "## Artifact Information"
+            echo "- **Retention**: ${{ env.ARTIFACT_RETENTION_DAYS }} days"
+            echo "- **Compression**: None (RPMs are pre-compressed)"
+            echo ""
+            echo "## Usage in Downstream Workflows"
+            echo "\`\`\`yaml"
+            echo "jobs:"
+            echo "  your-job:"
+            echo "    steps:"
+            echo "      - uses: actions/download-artifact@v4"
+            echo "        with:"
+            echo "          name: ${{ steps.set_outputs.outputs.artifact_name }}"
+            echo "          path: cloudberry-rpm"
+            echo "\`\`\`"
+            echo ""
+            echo "## Calling This Workflow"
+            echo "\`\`\`yaml"
+            echo "jobs:"
+            echo "  build-rpm:"
+            echo "    uses: apache/cloudberry-pxf/.github/workflows/build-cloudberry-rpm.yml@main"
+            echo "    with:"
+            echo "      cloudberry_ref: main"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

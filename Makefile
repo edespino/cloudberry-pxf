@@ -29,7 +29,7 @@ ifneq ($(FDW_SUPPORT),)
 endif
 
 cli:
-	make -C cli/go/src/pxf-cli
+	make -C cli/go/src/pxf-cli SHELL=/bin/bash
 
 server:
 	make -C server

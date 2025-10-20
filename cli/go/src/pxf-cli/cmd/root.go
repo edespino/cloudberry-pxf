@@ -14,6 +14,16 @@ var version string
 var rootCmd = &cobra.Command{
 	Use:     "pxf",
 	Version: version,
+	Run: func(cmd *cobra.Command, args []string) {
+		// Check if version flag was passed
+		versionFlag, _ := cmd.Flags().GetBool("version")
+		if versionFlag {
+			cmd.Printf("PXF version %s\n", version)
+			return
+		}
+		// Default behavior is to show help when no subcommands are provided
+		cmd.Help()
+	},
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
@@ -35,8 +45,11 @@ func init() {
 		Use:    "no-help",
 		Hidden: true,
 	})
-	rootCmd.SetVersionTemplate(`{{printf "PXF version %s" .Version}}
-`)
+
+	// Add version flag
+	rootCmd.Flags().BoolP("version", "v", false, "show the version of PXF server")
+
+	rootCmd.SetVersionTemplate(`{{printf "PXF version %s\n" .Version}}`)
 	rootCmd.SetUsageTemplate(`Usage: pxf cluster <command>
        pxf cluster {-h | --help}{{if .HasAvailableSubCommands}}
 
@@ -55,7 +68,4 @@ Additional help topics:{{range .Commands}}{{if .IsAdditionalHelpTopicCommand}}
 Use "{{.CommandPath}} [command] --help" for more information about a command.{{end}}
 
 `)
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
-	rootCmd.Flags().BoolP("version", "v", false, "show the version of PXF server")
 }

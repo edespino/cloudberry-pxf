@@ -3,7 +3,8 @@ include ../../../../common.mk
 .PHONY: all build stage install test clean help
 .DEFAULT_GOAL := build
 
-TARGET := $(shell echo $${PWD\#\#*/})
+SHELL := /bin/bash
+TARGET := $(shell basename $(CURDIR))
 PXF_ROOT_DIR := $(shell cd ../../../.. && pwd)
 PXF_SERVER_DIR := ${PXF_ROOT_DIR}/server
 PXF_CLI_DIR := ${PXF_ROOT_DIR}/cli
