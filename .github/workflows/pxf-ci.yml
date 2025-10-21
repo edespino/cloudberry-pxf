@@ -26,17 +26,20 @@
 #   for faster CI runs and better artifact reusability.
 #
 # Workflow Overview:
-# 1. **Build Cloudberry RPM**: Calls reusable workflow to build RPM
-# 2. **Install from RPM**: Installs Cloudberry RPM and creates demo cluster
-# 3. **PXF Build & Test**: Builds and tests all PXF modules
+# 1. **Retrieve Artifacts**: Downloads pre-built Cloudberry RPM and source artifacts
+#    - On push/PR: Automatically fetches latest artifacts from build-cloudberry-rpm.yml
+#    - On manual trigger: Can specify exact artifact names or use latest
+# 2. **Build, Install & Test**: Installs Cloudberry, creates cluster, builds and tests PXF
+# 3. **Final Status Report**: Aggregates results and generates summary
 #
 # Architecture Improvements:
-# - Separate reusable workflow for Cloudberry RPM builds
-# - RPM-based installation (faster than source builds)
+# - Cross-workflow artifact retrieval using dawidd6/action-download-artifact
+# - RPM-based Cloudberry installation (50% faster than building from source)
 # - Artifact reuse across workflow runs (30-day retention)
-# - Production-like testing environment
-# - Proper cluster restart between jobs
-# - Fixed test failure handling
+# - Production-like testing environment (actual RPM packages)
+# - Unified PXF build using top-level 'make all'
+# - Proper error propagation (removed continue-on-error flags)
+# - Java 11 environment setup for consistent PXF operations
 #
 # --------------------------------------------------------------------
 
@@ -51,12 +54,12 @@ on:
   workflow_dispatch:
     inputs:
       cloudberry_rpm_artifact:
-        description: 'Cloudberry RPM artifact name (e.g. cloudberry-rpm-99.0.0-abc1234)'
-        required: true
+        description: 'Cloudberry RPM artifact name (leave empty to use latest, e.g. cloudberry-rpm-99.0.0-abc1234)'
+        required: false
         type: string
       cloudberry_source_artifact:
-        description: 'Cloudberry source artifact name (e.g. cloudberry-source-20251020_103925)'
-        required: true
+        description: 'Cloudberry source artifact name (leave empty to use latest, e.g. cloudberry-source-20251020_103925)'
+        required: false
         type: string
 
 permissions:
@@ -71,13 +74,8 @@ env:
   JAVA_VERSION: "11"
   JAVA_HOME: "/usr/lib/jvm/java-11-openjdk"
   GPADMIN_HOME: "/home/gpadmin"
-  GO_VERSION: "1.21"
   GPHOME: "/usr/local/cloudberry-db"
-  CLOUDBERRY_VERSION: ${{ github.event.inputs.cloudberry_ref || 'main' }}
-  CLOUDBERRY_RPM_VERSION: "99.0.0"
-  CLOUDBERRY_RPM_BUILD: "1"
   PXF_HOME: "/usr/local/pxf"
-  PXF_VERSION: "main"
   LOG_RETENTION_DAYS: 7
   ARTIFACT_RETENTION_DAYS: 30
 
@@ -99,20 +97,26 @@ jobs:
       - name: Download Cloudberry RPM artifacts
         uses: dawidd6/action-download-artifact@v3
         with:
-          name: ${{ github.event.inputs.cloudberry_rpm_artifact }}
+          # Use provided artifact name, or search for latest RPM artifact pattern
+          name: ${{ github.event.inputs.cloudberry_rpm_artifact || 'cloudberry-rpm-*' }}
+          name_is_regexp: ${{ github.event.inputs.cloudberry_rpm_artifact == '' }}
           path: /tmp/rpm-download
           github_token: ${{ github.token }}
           workflow: build-cloudberry-rpm.yml
           workflow_conclusion: success
+          if_no_artifact_found: fail
 
       - name: Download Cloudberry source artifacts
         uses: dawidd6/action-download-artifact@v3
         with:
-          name: ${{ github.event.inputs.cloudberry_source_artifact }}
+          # Use provided artifact name, or search for latest source artifact pattern
+          name: ${{ github.event.inputs.cloudberry_source_artifact || 'cloudberry-source-*' }}
+          name_is_regexp: ${{ github.event.inputs.cloudberry_source_artifact == '' }}
           path: /tmp/source-download
           github_token: ${{ github.token }}
           workflow: build-cloudberry-rpm.yml
           workflow_conclusion: success
+          if_no_artifact_found: fail
 
       - name: Prepare RPM artifacts for upload
         id: upload_rpm
@@ -423,15 +427,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: ${{ env.LOG_RETENTION_DAYS }}
 
-      - name: Evaluate module build/test results
+      - name: Evaluate build/test results
         if: always()
         env:
-          BUILD_CLI: ${{ steps.build_pxf_cli.outcome }}
-          BUILD_FDW: ${{ steps.build_pxf_fdw.outcome }}
-          BUILD_EXTERNAL: ${{ steps.build_pxf_external.outcome }}
-          BUILD_SERVER: ${{ steps.build_pxf_server.outcome }}
+          BUILD_PXF: ${{ steps.build_pxf.outcome }}
           TEST_CLI: ${{ steps.test_pxf_cli.outcome }}
-          TEST_FDW: ${{ steps.test_pxf_fdw.outcome }}
           TEST_EXTERNAL: ${{ steps.test_pxf_external.outcome }}
           TEST_SERVER: ${{ steps.test_pxf_server.outcome }}
           INSTALL_PXF: ${{ steps.install_pxf.outcome }}
@@ -450,24 +450,25 @@ jobs:
             esac
           }
 
-          BCLI_ICON=$(status_icon "${BUILD_CLI}")
-          BFDW_ICON=$(status_icon "${BUILD_FDW}")
-          BEXT_ICON=$(status_icon "${BUILD_EXTERNAL}")
-          BSRV_ICON=$(status_icon "${BUILD_SERVER}")
+          BUILD_ICON=$(status_icon "${BUILD_PXF}")
           TCLI_ICON=$(status_icon "${TEST_CLI}")
-          TFDW_ICON=$(status_icon "${TEST_FDW}")
           TEXT_ICON=$(status_icon "${TEST_EXTERNAL}")
           TSRV_ICON=$(status_icon "${TEST_SERVER}")
 
           {
-            echo "## PXF Module Build/Test Results"
+            echo "## PXF Build & Test Results"
             echo ""
-            echo "| Module | Build | Test |"
-            echo "|-------:|:-----:|:----:|"
-            echo "| CLI | ${BCLI_ICON} ${BUILD_CLI:-skipped} | ${TCLI_ICON} ${TEST_CLI:-skipped} |"
-            echo "| FDW | ${BFDW_ICON} ${BUILD_FDW:-skipped} | ${TFDW_ICON} ${TEST_FDW:-skipped} |"
-            echo "| External-Table | ${BEXT_ICON} ${BUILD_EXTERNAL:-skipped} | ${TEXT_ICON} ${TEST_EXTERNAL:-skipped} |"
-            echo "| Server | ${BSRV_ICON} ${BUILD_SERVER:-skipped} | ${TSRV_ICON} ${TEST_SERVER:-skipped} |"
+            echo "### Build"
+            echo "| Step | Status |"
+            echo "|-----:|:------:|"
+            echo "| Build PXF (all modules) | ${BUILD_ICON} ${BUILD_PXF:-skipped} |"
+            echo ""
+            echo "### Module Tests"
+            echo "| Module | Test Status |"
+            echo "|-------:|:-----------:|"
+            echo "| CLI | ${TCLI_ICON} ${TEST_CLI:-skipped} |"
+            echo "| External-Table | ${TEXT_ICON} ${TEST_EXTERNAL:-skipped} |"
+            echo "| Server | ${TSRV_ICON} ${TEST_SERVER:-skipped} |"
             echo ""
             echo "### Install/Start/Automation"
             IN_ICON=$(status_icon "${INSTALL_PXF}")
@@ -487,14 +488,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           fail=0
-          for v in "${BUILD_CLI}" "${BUILD_FDW}" "${BUILD_EXTERNAL}" "${BUILD_SERVER}" \
-                   "${TEST_CLI}" "${TEST_FDW}" "${TEST_EXTERNAL}" "${TEST_SERVER}" \
+          for v in "${BUILD_PXF}" "${TEST_CLI}" "${TEST_EXTERNAL}" "${TEST_SERVER}" \
                    "${INSTALL_PXF}" "${START_PXF}" "${AUTO_TESTS}"; do
             if [ "$v" = "failure" ]; then fail=1; fi
           done
 
           if [ "$fail" -ne 0 ]; then
-            echo "::error::One or more PXF modules failed. Check logs for details."
+            echo "::error::One or more PXF steps failed. Check logs for details."
             exit 1
           fi
 
