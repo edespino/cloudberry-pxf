@@ -87,9 +87,9 @@ on:
         description: "Cloudberry commit SHA"
         value: ${{ jobs.build-cloudberry-rpm.outputs.commit_sha }}
 
-  # Weekly builds to keep fresh RPMs available (optional, can uncomment)
-  # schedule:
-  #   - cron: '0 0 * * 0'  # Every Sunday at midnight UTC
+  # Weekly builds to keep fresh RPMs available
+  schedule:
+    - cron: '0 0 * * 0'  # Every Sunday at midnight UTC
 
 permissions:
   contents: read
